@@ -1,0 +1,61 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod input;
+mod model;
+mod server;
+mod ui;
+
+use model::{Config, Model};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+pub type Shared = Arc<Mutex<Model>>;
+fn config_path() -> PathBuf {
+    std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("roundkeys.exe"))
+        .parent()
+        .unwrap()
+        .join("config.json")
+}
+fn main() -> eframe::Result {
+    let config_path = config_path();
+    let (config, error) = match Config::load(&config_path) {
+        Ok(c) => (c, None),
+        Err(e) => (
+            Config::default(),
+            Some(format!("配置读取失败，已使用默认值（原文件保留）：{e}")),
+        ),
+    };
+    let shared = Arc::new(Mutex::new(Model::new(config)));
+    shared.lock().unwrap().demo = std::env::args().any(|a| a == "--demo");
+    input::start(shared.clone());
+    let port = std::env::var("ROUNDKEYS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(17842);
+    server::start(shared.clone(), port);
+    if std::env::args().any(|a| a == "--headless") {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([1110.0, 790.0])
+        .with_min_inner_size([940.0, 650.0]);
+    if std::env::args().any(|a| a == "--capture-ui") {
+        viewport = viewport
+            .with_position([-4000.0, -4000.0])
+            .with_active(false)
+            .with_visible(false);
+    }
+    let options = eframe::NativeOptions {
+        viewport,
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "RoundKeys · 7K + Scratch",
+        options,
+        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, shared, config_path, port, error)))),
+    )
+}

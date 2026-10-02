@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RoundKeys OBS</title>
+<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}canvas{display:block;width:100%;height:100%}#offline{display:none;position:absolute;inset:auto 20px 12px;font:13px system-ui;color:#ffc0cc;background:#242030cc;padding:8px 14px;border-radius:12px;width:max-content}</style></head>
+<body><canvas id="view"></canvas><div id="offline">RoundKeys 已断开，等待重新连接…</div>
+<script>
+'use strict';
+const canvas=document.getElementById('view'),ctx=canvas.getContext('2d'),offline=document.getElementById('offline');
+let state=null,received=0,connected=false,clockOffset=null;
+const rgba=(c,a=1)=>`rgba(${c[0]},${c[1]},${c[2]},${c[3]/255*a})`;
+function rounded(x,y,w,h,r,fill,stroke,width=1){if(w<=0||h<=0)return;ctx.beginPath();ctx.roundRect(x,y,w,h,Math.min(r,w/2,h/2));if(fill){ctx.fillStyle=fill;ctx.fill()}if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=width;ctx.stroke()}}
+function layout(c){const width=40+c.scratch_size+c.scratch_gap+c.key_width*7+c.spacing*6,height=c.trail_height+Math.max(c.key_height,c.scratch_size)+52;
+ const base=height-24;return{width,height,lanes:Array.from({length:8},(_,i)=>{let w=i?c.key_width:c.scratch_size,h=i?c.key_height:c.scratch_size;let x=i?20+c.scratch_size+c.scratch_gap+(i-1)*(c.key_width+c.spacing):20;let y=base-h-(c.stagger&&i>0&&i%2===0?14:0);return{x,y,w,h}})}}
+function render(){requestAnimationFrame(render);const dpr=Math.min(devicePixelRatio||1,2);const pw=innerWidth,ph=innerHeight;if(canvas.width!==Math.round(pw*dpr)||canvas.height!==Math.round(ph*dpr)){canvas.width=Math.round(pw*dpr);canvas.height=Math.round(ph*dpr)}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,pw,ph);if(!state)return;
+ const c=state.config,l=layout(c),scale=Math.min(pw/l.width,ph/l.height);ctx.translate((pw-l.width*scale)/2,(ph-l.height*scale)/2);ctx.scale(scale,scale);
+ rounded(0,0,l.width,l.height,24,rgba(c.background));
+ const elapsed=connected?Math.min(performance.now()-received,100):0;const now=state.now+elapsed-c.output_delay_ms;
+ l.lanes.forEach((lane,i)=>{if(c.show_guides)rounded(lane.x,lane.y-c.trail_height,lane.w,c.trail_height,10,rgba(c.lanes[i].color,.045));});
+ for(const s of state.strokes){if(now<s.start)continue;const lane=l.lanes[s.lane],bottomTime=s.end===null?now:Math.min(now,s.end);let top=lane.y-(now-s.start)*c.speed/1000,bottom=lane.y-(now-bottomTime)*c.speed/1000;if(bottom<lane.y-c.trail_height)continue;const bound=lane.y-c.trail_height;top=Math.max(top,bound);bottom=Math.min(bottom,lane.y);const h=Math.max(bottom-top,4);const fade=Math.min(1,Math.max(0,(bottom-bound)/70));let color=c.lanes[s.lane].color;
+ ctx.save();ctx.beginPath();ctx.rect(lane.x-16,bound,lane.w+32,c.trail_height);ctx.clip();ctx.shadowColor=rgba(color,c.glow*.5);ctx.shadowBlur=c.glow*12;rounded(lane.x+5,top,lane.w-10,h,c.radius*.65,rgba(color,c.trail_opacity*fade));ctx.restore();}
+ l.lanes.forEach((lane,i)=>{const color=c.lanes[i].color;const active=connected&&state.strokes.some(s=>s.lane===i&&now>=s.start&&(s.end===null||now<s.end));ctx.save();if(active){ctx.shadowColor=rgba(color,.8);ctx.shadowBlur=24*c.glow;}let fill=active?rgba(color,.93):'rgba(22,27,42,.90)',stroke=rgba(color,active?1:.48);
+ if(i===0){const x=lane.x+lane.w/2,y=lane.y+lane.h/2,r=lane.w/2-2;ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle=fill;ctx.fill();ctx.strokeStyle=stroke;ctx.lineWidth=2;ctx.stroke();ctx.shadowBlur=0;ctx.beginPath();ctx.arc(x,y,r-9,0,Math.PI*2);ctx.strokeStyle=rgba(color,.28);ctx.lineWidth=1;ctx.stroke();ctx.save();ctx.translate(x,y);ctx.rotate(active?now/180:0);ctx.fillStyle=active?'#171c2b':rgba(color,.7);rounded(-2,-r+15,4,12,2,ctx.fillStyle);ctx.restore();}
+ else rounded(lane.x,lane.y+(active?3:0),lane.w,lane.h-(active?3:0),c.radius,fill,stroke,active?2:1.4);
+ ctx.shadowBlur=0;if(c.show_labels){ctx.textAlign='center';ctx.textBaseline='middle';ctx.font=`600 ${i===0?16:21}px "Segoe UI",system-ui,sans-serif`;ctx.fillStyle=active?'#171c2b':rgba(color,.95);ctx.fillText(c.lanes[i].label,lane.x+lane.w/2,lane.y+lane.h/2,lane.w-10);}ctx.restore();});
+}
+function connect(){const socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`);socket.onmessage=event=>{try{const next=JSON.parse(event.data);if(!next.config||!Array.isArray(next.strokes))return;state=next;received=performance.now();connected=true;offline.style.display='none';}catch(e){console.error(e)}};socket.onclose=()=>{connected=false;state=null;offline.style.display='block';setTimeout(connect,1000)};socket.onerror=()=>socket.close();}
+connect();requestAnimationFrame(render);
+</script></body></html>

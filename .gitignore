@@ -1,0 +1,10 @@
+/target/
+/dist/
+/rustup-init.exe
+/config.json
+/config.json.tmp
+/config.json.bak
+/roundkeys.log
+/tests/artifacts/
+/tests/*.pid
+
