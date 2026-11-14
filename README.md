@@ -2,6 +2,8 @@
 
 Windows 下的 Rust 音游输入显示器：左侧圆形转盘 + 7 个圆角键，按住生成向上流动的轨迹，松开后轨迹继续向上消失。适合 beatoraja / IIDX 的 OBS 直播与录制。
 
+![RoundKeys 的 OBS 图层演示，包含转盘、七键和输入轨迹](docs/roundkeys-demo.gif)
+
 ## 启动
 
 运行 `dist/roundkeys.exe`。GUI 负责绑定和外观设置，保持程序运行时 OBS 才能接收输入。默认不会自动启动或控制 OBS、beatoraja、IIDX。
