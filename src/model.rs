@@ -91,10 +91,19 @@ impl Default for Lane {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScratchSide {
+    Left,
+    Right,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub lanes: [Lane; 8],
+    pub lanes: Vec<Lane>,
+    pub key_count: usize,
+    pub scratch_sides: Vec<ScratchSide>,
     pub key_width: f32,
     pub key_height: f32,
     pub spacing: f32,
@@ -109,6 +118,7 @@ pub struct Config {
     pub show_labels: bool,
     pub show_guides: bool,
     pub stagger: bool,
+    pub trail_stagger: bool,
     pub output_delay_ms: f64,
     pub scratch_threshold: f64,
     pub scratch_release_ms: f64,
@@ -117,24 +127,28 @@ impl Default for Config {
     fn default() -> Self {
         let codes = [160, 83, 68, 70, 32, 74, 75, 76];
         Self {
-            lanes: std::array::from_fn(|i| Lane {
-                label: if i == 0 { "SCR".into() } else { i.to_string() },
-                color: if i == 0 {
-                    [255, 163, 192, 255]
-                } else if i % 2 == 0 {
-                    [170, 158, 255, 255]
-                } else {
-                    [160, 224, 228, 255]
-                },
-                bindings: if i == 0 {
-                    vec![
-                        Binding::Keyboard { code: 160 },
-                        Binding::Keyboard { code: 162 },
-                    ]
-                } else {
-                    vec![Binding::Keyboard { code: codes[i] }]
-                },
-            }),
+            key_count: 7,
+            scratch_sides: vec![ScratchSide::Left],
+            lanes: (0..8)
+                .map(|i| Lane {
+                    label: if i == 0 { "SCR".into() } else { i.to_string() },
+                    color: if i == 0 {
+                        [255, 163, 192, 255]
+                    } else if i % 2 == 0 {
+                        [170, 158, 255, 255]
+                    } else {
+                        [160, 224, 228, 255]
+                    },
+                    bindings: if i == 0 {
+                        vec![
+                            Binding::Keyboard { code: 160 },
+                            Binding::Keyboard { code: 162 },
+                        ]
+                    } else {
+                        vec![Binding::Keyboard { code: codes[i] }]
+                    },
+                })
+                .collect(),
             key_width: 62.0,
             key_height: 68.0,
             spacing: 10.0,
@@ -149,6 +163,7 @@ impl Default for Config {
             show_labels: true,
             show_guides: false,
             stagger: true,
+            trail_stagger: true,
             output_delay_ms: 0.0,
             scratch_threshold: 0.001,
             scratch_release_ms: 65.0,
@@ -157,13 +172,20 @@ impl Default for Config {
 }
 impl Config {
     pub fn normalize(&mut self) {
+        self.key_count = self.key_count.clamp(1, 32);
+        self.scratch_sides.truncate(4);
+        let total = self.key_count + self.scratch_sides.len();
+        self.lanes.truncate(total);
+        while self.lanes.len() < total {
+            self.lanes.push(self.default_lane(self.lanes.len()));
+        }
         self.key_width = finite(self.key_width, 62.0).clamp(32.0, 120.0);
         self.key_height = finite(self.key_height, 68.0).clamp(32.0, 120.0);
         self.spacing = finite(self.spacing, 10.0).clamp(2.0, 48.0);
         self.scratch_size = finite(self.scratch_size, 92.0).clamp(48.0, 150.0);
         self.scratch_gap = finite(self.scratch_gap, 26.0).clamp(4.0, 90.0);
         self.radius = finite(self.radius, 16.0).clamp(4.0, 48.0);
-        self.trail_height = finite(self.trail_height, 380.0).clamp(120.0, 900.0);
+        self.trail_height = finite(self.trail_height, 380.0).clamp(120.0, 2000.0);
         self.speed = finite(self.speed, 270.0).clamp(60.0, 900.0);
         self.trail_opacity = finite(self.trail_opacity, 0.8).clamp(0.1, 1.0);
         self.glow = finite(self.glow, 0.65).clamp(0.0, 1.0);
@@ -194,11 +216,124 @@ impl Config {
             lane.bindings.truncate(4);
         }
     }
+    fn default_lane(&self, index: usize) -> Lane {
+        if self.is_scratch(index) {
+            Lane {
+                label: format!("SCR{}", index + 1),
+                color: [255, 163, 192, 255],
+                bindings: vec![],
+            }
+        } else {
+            let key = index - self.scratch_sides.len();
+            let codes = [83, 68, 70, 32, 74, 75, 76];
+            Lane {
+                label: (key + 1).to_string(),
+                color: if key.is_multiple_of(2) {
+                    [160, 224, 228, 255]
+                } else {
+                    [170, 158, 255, 255]
+                },
+                bindings: codes
+                    .get(key)
+                    .map(|&code| vec![Binding::Keyboard { code }])
+                    .unwrap_or_default(),
+            }
+        }
+    }
+    pub fn is_scratch(&self, lane: usize) -> bool {
+        lane < self.scratch_sides.len()
+    }
+    pub fn set_layout(&mut self, keys: usize, sides: Vec<ScratchSide>) {
+        let old_scratch = self.scratch_sides.len();
+        let old = self.lanes.clone();
+        self.key_count = keys.clamp(1, 32);
+        self.scratch_sides = sides.into_iter().take(4).collect();
+        self.lanes = (0..self.key_count + self.scratch_sides.len())
+            .map(|i| {
+                let previous = if self.is_scratch(i) {
+                    (i < old_scratch).then_some(i)
+                } else {
+                    Some(old_scratch + i - self.scratch_sides.len())
+                };
+                previous
+                    .and_then(|j| old.get(j))
+                    .cloned()
+                    .unwrap_or_else(|| self.default_lane(i))
+            })
+            .collect();
+    }
+    pub fn control_height(&self) -> f32 {
+        if self.scratch_sides.is_empty() {
+            self.key_height
+        } else {
+            self.key_height.max(self.scratch_size)
+        }
+    }
     pub fn dimensions(&self) -> [f32; 2] {
         [
-            40.0 + self.scratch_size + self.scratch_gap + self.key_width * 7.0 + self.spacing * 6.0,
-            self.trail_height + self.key_height.max(self.scratch_size) + 52.0,
+            40.0 + self.key_width * self.key_count as f32
+                + self.spacing * self.key_count.saturating_sub(1) as f32
+                + (self.scratch_size + self.scratch_gap) * self.scratch_sides.len() as f32,
+            self.trail_height + self.control_height() + 52.0,
         ]
+    }
+    pub fn lane_geometry(&self, lane: usize) -> [f32; 4] {
+        let left = self
+            .scratch_sides
+            .iter()
+            .filter(|&&s| s == ScratchSide::Left)
+            .count();
+        let key_start = 20.0 + left as f32 * (self.scratch_size + self.scratch_gap);
+        let (x, w, h, raised) = if self.is_scratch(lane) {
+            let side = self.scratch_sides[lane];
+            let rank = self.scratch_sides[..lane]
+                .iter()
+                .filter(|&&s| s == side)
+                .count();
+            let x = if side == ScratchSide::Left {
+                20.0 + rank as f32 * (self.scratch_size + self.scratch_gap)
+            } else {
+                key_start
+                    + self.key_count as f32 * self.key_width
+                    + self.key_count.saturating_sub(1) as f32 * self.spacing
+                    + self.scratch_gap
+                    + rank as f32 * (self.scratch_size + self.scratch_gap)
+            };
+            (x, self.scratch_size, self.scratch_size, 0.0)
+        } else {
+            let key = lane - self.scratch_sides.len();
+            (
+                key_start + key as f32 * (self.key_width + self.spacing),
+                self.key_width,
+                self.key_height,
+                if self.stagger && key % 2 == 1 {
+                    14.0
+                } else {
+                    0.0
+                },
+            )
+        };
+        [x, self.dimensions()[1] - 24.0 - h - raised, w, h]
+    }
+    pub fn trail_origin(&self, lane: usize) -> f32 {
+        if self.trail_stagger {
+            self.lane_geometry(lane)[1]
+        } else {
+            self.dimensions()[1]
+                - 24.0
+                - self
+                    .control_height()
+                    .max(self.key_height + if self.stagger { 14.0 } else { 0.0 })
+        }
+    }
+    pub fn set_aspect_ratio(&mut self, ratio: f32) {
+        let [width, height] = self.dimensions();
+        let ratio = finite(ratio, width / height).max(0.01);
+        self.set_output_height(width / ratio);
+    }
+    pub fn set_output_height(&mut self, height: f32) {
+        let fixed = self.control_height() + 52.0;
+        self.trail_height = (finite(height, self.dimensions()[1]) - fixed).clamp(120.0, 2000.0);
     }
     pub fn load(path: &Path) -> Result<Self, String> {
         if !path.exists() {
@@ -255,14 +390,14 @@ pub struct Snapshot {
     pub now: f64,
     pub config: Config,
     pub strokes: Vec<Stroke>,
-    pub pressed: [bool; 8],
-    pub counts: [u64; 8],
+    pub pressed: Vec<bool>,
+    pub counts: Vec<u64>,
 }
 pub struct Model {
     pub config: Config,
     pub epoch: Instant,
     pub strokes: Vec<Stroke>,
-    pub counts: [u64; 8],
+    pub counts: Vec<u64>,
     pub down: HashSet<Binding>,
     pub capture: Option<(usize, usize)>,
     pub capture_version: u64,
@@ -276,12 +411,14 @@ pub struct Model {
     pub demo: bool,
 }
 impl Model {
-    pub fn new(config: Config) -> Self {
+    pub fn new(mut config: Config) -> Self {
+        config.normalize();
+        let count = config.lanes.len();
         Self {
             config,
             epoch: Instant::now(),
             strokes: vec![],
-            counts: [0; 8],
+            counts: vec![0; count],
             down: HashSet::new(),
             capture: None,
             capture_version: 0,
@@ -295,23 +432,40 @@ impl Model {
             demo: false,
         }
     }
+    pub fn apply_config(&mut self, mut config: Config) {
+        config.normalize();
+        if config.key_count != self.config.key_count
+            || config.scratch_sides != self.config.scratch_sides
+        {
+            self.clear(self.now());
+            self.capture = None;
+            self.counts = vec![0; config.lanes.len()];
+        }
+        self.config = config;
+    }
     pub fn now(&self) -> f64 {
         self.epoch.elapsed().as_secs_f64() * 1000.0
     }
-    pub fn pressed(&self) -> [bool; 8] {
-        std::array::from_fn(|i| {
-            !self.paused
-                && self.config.lanes[i]
-                    .bindings
-                    .iter()
-                    .any(|b| self.down.contains(b))
-        })
+    pub fn pressed(&self) -> Vec<bool> {
+        (0..self.config.lanes.len())
+            .map(|i| {
+                !self.paused
+                    && self.config.lanes[i]
+                        .bindings
+                        .iter()
+                        .any(|b| self.down.contains(b))
+            })
+            .collect()
     }
     pub fn transition(&mut self, binding: Binding, down: bool, at: f64) {
         if down && !self.down.contains(&binding) {
             self.last_input = binding.label();
         }
-        if down && let Some((lane, slot)) = self.capture {
+        if down
+            && let Some((lane, slot)) = self
+                .capture
+                .filter(|(lane, _)| *lane < self.config.lanes.len())
+        {
             if binding == (Binding::Keyboard { code: 27 }) {
                 self.capture = None;
                 return;
@@ -331,13 +485,31 @@ impl Model {
             }
         }
         let before = self.pressed();
+        // SCR bindings represent turn directions: a new direction starts a new note.
+        if down && !self.down.contains(&binding) {
+            for (i, &pressed) in before
+                .iter()
+                .enumerate()
+                .take(self.config.scratch_sides.len())
+            {
+                if pressed && self.config.lanes[i].bindings.contains(&binding) {
+                    self.release(i, at);
+                    self.counts[i] += 1;
+                    self.strokes.push(Stroke {
+                        lane: i,
+                        start: at,
+                        end: None,
+                    });
+                }
+            }
+        }
         if down {
             self.down.insert(binding);
         } else {
             self.down.remove(&binding);
         }
         let after = self.pressed();
-        for i in 0..8 {
+        for i in 0..self.config.lanes.len() {
             if !before[i] && after[i] {
                 self.counts[i] += 1;
                 self.strokes.push(Stroke {
@@ -379,17 +551,13 @@ impl Model {
         let mut strokes = self.strokes.clone();
         let mut pressed = self.pressed();
         if self.demo {
-            pressed = [false; 8];
+            pressed = vec![false; self.config.lanes.len()];
             strokes.clear();
             for step in ((now / 190.0) as i64 - 30).max(0)..=(now / 190.0) as i64 {
-                let lane = if step % 9 == 0 {
-                    0
-                } else {
-                    (step % 7 + 1) as usize
-                };
+                let lane = step as usize % self.config.lanes.len();
                 let start = step as f64 * 190.0;
                 let end = start
-                    + if lane == 0 {
+                    + if self.config.is_scratch(lane) {
                         220.0
                     } else if step % 5 == 0 {
                         480.0
@@ -411,7 +579,7 @@ impl Model {
             config: self.config.clone(),
             strokes,
             pressed,
-            counts: self.counts,
+            counts: self.counts.clone(),
         }
     }
 }
@@ -419,6 +587,109 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_config_keeps_bindings_and_right_scratch_keeps_identity() {
+        let old = Config::default();
+        let mut value = serde_json::to_value(&old).unwrap();
+        value.as_object_mut().unwrap().remove("key_count");
+        value.as_object_mut().unwrap().remove("scratch_sides");
+        let mut c: Config = serde_json::from_value(value).unwrap();
+        c.normalize();
+        assert_eq!(c.lanes[1].bindings, old.lanes[1].bindings);
+        c.set_layout(7, vec![ScratchSide::Right]);
+        assert_eq!(c.lanes[0].bindings, old.lanes[0].bindings);
+        assert!(c.lane_geometry(0)[0] > c.lane_geometry(7)[0]);
+        assert_eq!(c.dimensions(), old.dimensions());
+    }
+    #[test]
+    fn changing_lane_counts_preserves_keys_and_has_no_overlaps() {
+        let mut c = Config::default();
+        let first = c.lanes[1].bindings.clone();
+        c.set_layout(14, vec![ScratchSide::Left, ScratchSide::Right]);
+        assert_eq!(c.lanes[2].bindings, first);
+        assert_eq!(c.lanes.len(), 16);
+        let mut geometry: Vec<_> = (0..c.lanes.len()).map(|i| c.lane_geometry(i)).collect();
+        geometry.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        for pair in geometry.windows(2) {
+            assert!(pair[0][0] + pair[0][2] < pair[1][0]);
+        }
+        assert!(
+            geometry.last().unwrap()[0] + geometry.last().unwrap()[2] <= c.dimensions()[0] - 20.0
+        );
+        c.set_layout(5, vec![]);
+        assert_eq!(c.lanes[0].bindings, first);
+        assert_eq!(c.lanes.len(), 5);
+        assert_eq!(c.dimensions()[0], 390.0);
+    }
+    #[test]
+    fn multiple_scratches_split_independently_and_layout_change_clears_holds() {
+        let mut c = Config::default();
+        c.set_layout(4, vec![ScratchSide::Left, ScratchSide::Right]);
+        c.lanes[1].bindings = vec![
+            Binding::Keyboard { code: 161 },
+            Binding::Keyboard { code: 163 },
+        ];
+        let mut m = Model::new(c);
+        m.transition(Binding::Keyboard { code: 160 }, true, 0.0);
+        m.transition(Binding::Keyboard { code: 161 }, true, 10.0);
+        m.transition(Binding::Keyboard { code: 163 }, true, 20.0);
+        assert_eq!(m.counts[..2], [1, 2]);
+        assert!(
+            m.strokes
+                .iter()
+                .find(|s| s.lane == 0)
+                .unwrap()
+                .end
+                .is_none()
+        );
+        let mut c = m.config.clone();
+        c.set_layout(32, vec![]);
+        m.apply_config(c);
+        assert!(m.strokes.is_empty());
+        assert!(m.down.is_empty());
+        assert_eq!(m.snapshot().pressed.len(), 32);
+        assert_eq!(m.counts.len(), 32);
+    }
+    #[test]
+    fn custom_height_preserves_key_geometry_and_survives_save_format() {
+        let mut c = Config::default();
+        let width = c.dimensions()[0];
+        c.set_output_height(1080.0);
+        assert_eq!(c.dimensions(), [width, 1080.0]);
+        assert_eq!(c.key_height, 68.0);
+        assert_eq!(c.speed, 270.0);
+        let mut restored: Config =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        restored.normalize();
+        assert_eq!(restored.dimensions()[1], 1080.0);
+        restored.set_output_height(0.0);
+        assert_eq!(restored.trail_height, 120.0);
+    }
+    #[test]
+    fn aspect_ratio_changes_layout_without_stretching_controls() {
+        let mut c = Config::default();
+        c.set_aspect_ratio(16.0 / 9.0);
+        let [w, h] = c.dimensions();
+        assert!((w / h - 16.0 / 9.0).abs() < 0.0001);
+        assert_eq!(c.scratch_size, 92.0);
+        assert_eq!(c.key_width, 62.0);
+        c.set_aspect_ratio(1.0);
+        assert_eq!(c.dimensions(), [652.0, 652.0]);
+    }
+    #[test]
+    fn trail_origin_can_align_without_changing_key_stagger() {
+        let mut c = Config::default();
+        assert_ne!(c.trail_origin(1), c.trail_origin(2));
+        c.trail_stagger = false;
+        for i in 1..8 {
+            assert_eq!(c.trail_origin(0), c.trail_origin(i));
+        }
+        assert!(c.stagger);
+        let restored: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(!restored.trail_stagger);
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(old.trail_stagger);
+    }
     #[test]
     fn held_key_repeats_do_not_make_extra_strokes() {
         let mut m = Model::new(Config::default());
@@ -431,7 +702,7 @@ mod tests {
         assert_eq!(m.counts[1], 1);
     }
     #[test]
-    fn scratch_two_directions_share_one_continuous_hold() {
+    fn scratch_reversal_splits_even_when_direction_inputs_overlap() {
         let mut m = Model::new(Config::default());
         let a = Binding::Keyboard { code: 160 };
         let b = Binding::Keyboard { code: 162 };
@@ -440,8 +711,37 @@ mod tests {
         m.transition(a, false, 20.0);
         assert!(m.pressed()[0]);
         m.transition(b, false, 30.0);
-        assert_eq!(m.strokes.len(), 1);
-        assert_eq!(m.strokes[0].end, Some(30.0));
+        assert_eq!(m.strokes.len(), 2);
+        assert_eq!(m.strokes[0].end, Some(10.0));
+        assert_eq!(m.strokes[1].start, 10.0);
+        assert_eq!(m.strokes[1].end, Some(30.0));
+        assert_eq!(m.counts[0], 2);
+    }
+    #[test]
+    fn scratch_axis_reversal_splits_but_same_direction_reports_do_not() {
+        let mut m = Model::new(Config::default());
+        let a = Binding::ControllerAxis {
+            device: 1,
+            axis: 0,
+            direction: 1,
+        };
+        let b = Binding::ControllerAxis {
+            device: 1,
+            axis: 0,
+            direction: -1,
+        };
+        m.config.lanes[0].bindings = vec![a, b];
+        m.transition(a, true, 0.0);
+        m.transition(a, true, 50.0);
+        m.transition(b, true, 100.0);
+        m.transition(a, false, 100.0);
+        m.transition(b, true, 110.0);
+        m.transition(b, false, 150.0);
+        assert_eq!(m.strokes.len(), 2);
+        assert_eq!(m.strokes[0].end, Some(100.0));
+        assert_eq!(m.strokes[1].start, 100.0);
+        assert_eq!(m.strokes[1].end, Some(150.0));
+        assert_eq!(m.counts[0], 2);
     }
     #[test]
     fn history_pruning_keeps_long_holds_and_discards_old_releases() {

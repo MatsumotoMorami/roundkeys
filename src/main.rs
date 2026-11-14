@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod input;
 mod model;
+mod presets;
 mod server;
 mod ui;
 
@@ -34,6 +35,16 @@ fn main() -> eframe::Result {
         .and_then(|s| s.parse().ok())
         .unwrap_or(17842);
     server::start(shared.clone(), port);
+    if std::env::args().any(|a| a == "--input-check") {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let mut m = shared.lock().unwrap();
+        let snapshot = m.snapshot();
+        println!(
+            "{}",
+            serde_json::json!({"input":m.input_status,"controllers":m.controller_status,"devices":m.devices,"last_input":m.last_input,"counts":snapshot.counts})
+        );
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--headless") {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -54,7 +65,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "RoundKeys · 7K + Scratch",
+        "RoundKeys · Keys + Scratch",
         options,
         Box::new(move |cc| Ok(Box::new(ui::App::new(cc, shared, config_path, port, error)))),
     )

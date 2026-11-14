@@ -5,14 +5,17 @@ use std::{
     collections::{HashMap, HashSet},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Devices::HumanInterfaceDevice::*,
     Foundation::*,
     Storage::FileSystem::*,
-    System::LibraryLoader::GetModuleHandleW,
-    UI::{Input::*, WindowsAndMessaging::*},
+    System::{IO::*, LibraryLoader::GetModuleHandleW, Threading::*},
+    UI::{
+        Input::{KeyboardAndMouse::GetAsyncKeyState, *},
+        WindowsAndMessaging::*,
+    },
 };
 
 struct Axis {
@@ -28,11 +31,16 @@ struct Device {
     buttons: Vec<HIDP_BUTTON_CAPS>,
     axes: Vec<Axis>,
     down: HashSet<u16>,
+    reader: Option<HidReader>,
+    reader_error: Option<String>,
+    reports: u64,
 }
 struct Engine {
     shared: Shared,
     devices: HashMap<usize, Device>,
     expiry: HashMap<Binding, f64>,
+    keyboard_down: HashSet<u16>,
+    last_hid_status: Instant,
 }
 thread_local! { static ENGINE:RefCell<Option<Engine>>=const{RefCell::new(None)}; }
 fn wide(s: &str) -> Vec<u16> {
@@ -69,7 +77,9 @@ pub fn run(shared: Shared) {
                 format!("输入窗口创建失败：{}", std::io::Error::last_os_error());
             return;
         }
-        let inputs: Vec<_> = [6, 4, 5, 8]
+        // GUI frameworks register keyboard Raw Input again inside this process.
+        // Keep HID on the dedicated sink; keyboard sampling below does not compete.
+        let inputs: Vec<_> = [4, 5, 8]
             .iter()
             .map(|&usage| RAWINPUTDEVICE {
                 usUsagePage: 1,
@@ -92,10 +102,12 @@ pub fn run(shared: Shared) {
             shared: shared.clone(),
             devices: HashMap::new(),
             expiry: HashMap::new(),
+            keyboard_down: HashSet::new(),
+            last_hid_status: Instant::now(),
         };
         engine.discover();
         ENGINE.with(|e| *e.borrow_mut() = Some(engine));
-        shared.lock().unwrap().input_status = "Raw Input 后台监听 · 不占用手台".into();
+        shared.lock().unwrap().input_status = "后台键盘采样 + HID 监听 · 无需窗口焦点".into();
         let mut message: MSG = zeroed();
         loop {
             while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -107,6 +119,8 @@ pub fn run(shared: Shared) {
             }
             ENGINE.with(|e| {
                 if let Some(e) = e.borrow_mut().as_mut() {
+                    e.poll_hid();
+                    e.poll_keyboard();
                     e.expire();
                 }
             });
@@ -131,6 +145,78 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 impl Engine {
+    fn poll_hid(&mut self) {
+        for d in self.devices.values_mut() {
+            for _ in 0..32 {
+                let Some(reader) = d.reader.as_mut() else {
+                    break;
+                };
+                match reader.poll() {
+                    Ok(Some(report)) => parse_report(d, &self.shared, &mut self.expiry, &report),
+                    Ok(None) => break,
+                    Err(error) => {
+                        d.reader_error = Some(error);
+                        d.reader = None;
+                        self.shared.lock().unwrap().controller_status = format!(
+                            "{}：直接读取失败，使用 Raw Input；{}",
+                            d.name,
+                            d.reader_error.as_deref().unwrap_or("")
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        if self.last_hid_status.elapsed() >= Duration::from_secs(1) {
+            self.last_hid_status = Instant::now();
+            let direct = self.devices.values().filter(|d| d.reader.is_some()).count();
+            let reports: u64 = self.devices.values().map(|d| d.reports).sum();
+            let errors = self
+                .devices
+                .values()
+                .filter_map(|d| d.reader_error.as_deref())
+                .collect::<Vec<_>>()
+                .join("；");
+            self.shared.lock().unwrap().controller_status = format!(
+                "HID 直接后台读取 {}/{} · 报告 {} {}",
+                direct,
+                self.devices.len(),
+                reports,
+                errors
+            );
+        }
+    }
+    fn poll_keyboard(&mut self) {
+        let mut m = self.shared.lock().unwrap();
+        let now = m.now();
+        let mut candidates: HashSet<u16> = m
+            .config
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.bindings.iter())
+            .filter_map(|b| match b {
+                Binding::Keyboard { code } => Some(*code),
+                _ => None,
+            })
+            .chain(self.keyboard_down.iter().copied())
+            .collect();
+        // Only bound keys are sampled normally; binding capture temporarily enables all keys.
+        if m.capture.is_some() {
+            candidates.extend(8..=254);
+        }
+        for code in candidates {
+            // High bit is current state. Do not consume the unreliable "recently pressed" bit.
+            let down = unsafe { GetAsyncKeyState(code as i32) } < 0;
+            if down != self.keyboard_down.contains(&code) {
+                if down {
+                    self.keyboard_down.insert(code);
+                } else {
+                    self.keyboard_down.remove(&code);
+                }
+                m.transition(Binding::Keyboard { code }, down, now);
+            }
+        }
+    }
     fn discover(&mut self) {
         unsafe {
             let mut count = 0;
@@ -219,43 +305,7 @@ impl Engine {
                 return;
             }
             let raw = &*(buf.as_ptr().cast::<RAWINPUT>());
-            if raw.header.dwType == RIM_TYPEKEYBOARD {
-                if size < (header as usize + size_of::<RAWKEYBOARD>()) as u32 {
-                    return;
-                }
-                let k = raw.data.keyboard;
-                let mut code = k.VKey;
-                code = match code {
-                    16 => {
-                        if k.MakeCode == 0x36 {
-                            161
-                        } else {
-                            160
-                        }
-                    }
-                    17 => {
-                        if k.Flags & 2 != 0 {
-                            163
-                        } else {
-                            162
-                        }
-                    }
-                    18 => {
-                        if k.Flags & 2 != 0 {
-                            165
-                        } else {
-                            164
-                        }
-                    }
-                    _ => code,
-                };
-                if code == 255 {
-                    return;
-                }
-                let mut m = self.shared.lock().unwrap();
-                let now = m.now();
-                m.transition(Binding::Keyboard { code }, k.Flags & 1 == 0, now);
-            } else if raw.header.dwType == RIM_TYPEHID {
+            if raw.header.dwType == RIM_TYPEHID {
                 if size < header + 8 {
                     return;
                 }
@@ -282,112 +332,8 @@ impl Engine {
                         start.add(n * hid.dwSizeHid as usize),
                         hid.dwSizeHid as usize,
                     );
-                    let mut m = self.shared.lock().unwrap();
-                    let now = m.now();
-                    let prep = d.prep.as_ptr() as PHIDP_PREPARSED_DATA;
-                    // Reports must not release buttons belonging to another report ID.
-                    for cap in &d.buttons {
-                        if cap.ReportID != 0 && report[0] != cap.ReportID {
-                            continue;
-                        }
-                        let mut usages = [0u16; 128];
-                        let mut count = 128;
-                        if HidP_GetUsages(
-                            HidP_Input,
-                            cap.UsagePage,
-                            cap.LinkCollection,
-                            usages.as_mut_ptr(),
-                            &mut count,
-                            prep,
-                            report.as_ptr() as *mut u8,
-                            report.len() as u32,
-                        ) != HIDP_STATUS_SUCCESS
-                        {
-                            continue;
-                        }
-                        let (min, max) = if cap.IsRange {
-                            (cap.Anonymous.Range.UsageMin, cap.Anonymous.Range.UsageMax)
-                        } else {
-                            let u = cap.Anonymous.NotRange.Usage;
-                            (u, u)
-                        };
-                        for usage in min..=max.min(128) {
-                            if usage == 0 {
-                                continue;
-                            }
-                            let pressed = usages[..count.min(128) as usize].contains(&usage);
-                            let was = d.down.contains(&usage);
-                            if pressed != was {
-                                if pressed {
-                                    d.down.insert(usage);
-                                } else {
-                                    d.down.remove(&usage);
-                                }
-                                m.transition(
-                                    Binding::ControllerButton {
-                                        device: d.id,
-                                        button: (usage - 1) as u8,
-                                    },
-                                    pressed,
-                                    now,
-                                );
-                            }
-                        }
-                    }
-                    for a in &mut d.axes {
-                        if a.cap.ReportID != 0 && report[0] != a.cap.ReportID {
-                            continue;
-                        }
-                        let mut v = 0;
-                        if HidP_GetUsageValue(
-                            HidP_Input,
-                            a.cap.UsagePage,
-                            a.cap.LinkCollection,
-                            a.usage,
-                            &mut v,
-                            prep,
-                            report.as_ptr(),
-                            report.len() as u32,
-                        ) != HIDP_STATUS_SUCCESS
-                        {
-                            continue;
-                        }
-                        let value =
-                            if a.cap.LogicalMin < 0 && a.cap.BitSize > 0 && a.cap.BitSize < 32 {
-                                ((v << (32 - a.cap.BitSize)) as i32 >> (32 - a.cap.BitSize)) as f64
-                            } else {
-                                v as f64
-                            };
-                        let range =
-                            (a.cap.LogicalMax as f64 - a.cap.LogicalMin as f64 + 1.0).max(1.0);
-                        let normalized = (value - a.cap.LogicalMin as f64) / range;
-                        if let Some(previous) = a.last {
-                            let delta = super::axis_delta(previous, normalized);
-                            if delta.signum() != a.accum.signum() {
-                                a.accum = 0.0;
-                            }
-                            a.accum += delta;
-                            if a.accum.abs() >= m.config.scratch_threshold {
-                                let direction = if a.accum > 0.0 { 1 } else { -1 };
-                                a.accum = 0.0;
-                                let binding = Binding::ControllerAxis {
-                                    device: d.id,
-                                    axis: (a.usage - 0x30) as u8,
-                                    direction,
-                                };
-                                let reverse = Binding::ControllerAxis {
-                                    device: d.id,
-                                    axis: (a.usage - 0x30) as u8,
-                                    direction: -direction,
-                                };
-                                m.transition(binding, true, now);
-                                m.transition(reverse, false, now);
-                                self.expiry.remove(&reverse);
-                                self.expiry
-                                    .insert(binding, now + m.config.scratch_release_ms);
-                            }
-                        }
-                        a.last = Some(normalized);
+                    if d.reader.is_none() {
+                        parse_report(d, &self.shared, &mut self.expiry, report);
                     }
                 }
             }
@@ -408,6 +354,210 @@ impl Engine {
         }
     }
 }
+fn parse_report(
+    d: &mut Device,
+    shared: &Shared,
+    expiry: &mut HashMap<Binding, f64>,
+    report: &[u8],
+) {
+    if report.is_empty() {
+        return;
+    }
+    d.reports += 1;
+    unsafe {
+        let mut m = shared.lock().unwrap();
+        let now = m.now();
+        let prep = d.prep.as_ptr() as PHIDP_PREPARSED_DATA;
+        // Reports must not release buttons belonging to another report ID.
+        for cap in &d.buttons {
+            if cap.ReportID != 0 && report[0] != cap.ReportID {
+                continue;
+            }
+            let mut usages = [0u16; 128];
+            let mut count = 128;
+            if HidP_GetUsages(
+                HidP_Input,
+                cap.UsagePage,
+                cap.LinkCollection,
+                usages.as_mut_ptr(),
+                &mut count,
+                prep,
+                report.as_ptr() as *mut u8,
+                report.len() as u32,
+            ) != HIDP_STATUS_SUCCESS
+            {
+                continue;
+            }
+            let (min, max) = if cap.IsRange {
+                (cap.Anonymous.Range.UsageMin, cap.Anonymous.Range.UsageMax)
+            } else {
+                let u = cap.Anonymous.NotRange.Usage;
+                (u, u)
+            };
+            for usage in min..=max.min(128) {
+                if usage == 0 {
+                    continue;
+                }
+                let pressed = usages[..count.min(128) as usize].contains(&usage);
+                let was = d.down.contains(&usage);
+                if pressed != was {
+                    if pressed {
+                        d.down.insert(usage);
+                    } else {
+                        d.down.remove(&usage);
+                    }
+                    m.transition(
+                        Binding::ControllerButton {
+                            device: d.id,
+                            button: (usage - 1) as u8,
+                        },
+                        pressed,
+                        now,
+                    );
+                }
+            }
+        }
+        for a in &mut d.axes {
+            if a.cap.ReportID != 0 && report[0] != a.cap.ReportID {
+                continue;
+            }
+            let mut v = 0;
+            if HidP_GetUsageValue(
+                HidP_Input,
+                a.cap.UsagePage,
+                a.cap.LinkCollection,
+                a.usage,
+                &mut v,
+                prep,
+                report.as_ptr(),
+                report.len() as u32,
+            ) != HIDP_STATUS_SUCCESS
+            {
+                continue;
+            }
+            let value = if a.cap.LogicalMin < 0 && a.cap.BitSize > 0 && a.cap.BitSize < 32 {
+                ((v << (32 - a.cap.BitSize)) as i32 >> (32 - a.cap.BitSize)) as f64
+            } else {
+                v as f64
+            };
+            let range = (a.cap.LogicalMax as f64 - a.cap.LogicalMin as f64 + 1.0).max(1.0);
+            let normalized = (value - a.cap.LogicalMin as f64) / range;
+            if let Some(previous) = a.last {
+                let delta = super::axis_delta(previous, normalized);
+                if delta.signum() != a.accum.signum() {
+                    a.accum = 0.0;
+                }
+                a.accum += delta;
+                if a.accum.abs() >= m.config.scratch_threshold {
+                    let direction = if a.accum > 0.0 { 1 } else { -1 };
+                    a.accum = 0.0;
+                    let binding = Binding::ControllerAxis {
+                        device: d.id,
+                        axis: (a.usage - 0x30) as u8,
+                        direction,
+                    };
+                    let reverse = Binding::ControllerAxis {
+                        device: d.id,
+                        axis: (a.usage - 0x30) as u8,
+                        direction: -direction,
+                    };
+                    m.transition(binding, true, now);
+                    m.transition(reverse, false, now);
+                    expiry.remove(&reverse);
+                    expiry.insert(binding, now + m.config.scratch_release_ms);
+                }
+            }
+            a.last = Some(normalized);
+        }
+    }
+}
+
+// A shared read-only handle receives reports independently of window focus.
+// OVERLAPPED and its buffer stay allocated until completion or cancellation.
+struct HidReader {
+    file: HANDLE,
+    overlap: Box<OVERLAPPED>,
+    buffer: Vec<u8>,
+    pending: bool,
+}
+impl HidReader {
+    unsafe fn open(path: &[u16], size: usize) -> Result<Self, String> {
+        unsafe {
+            let file = CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                null_mut(),
+            );
+            if file == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let event = CreateEventW(null(), 1, 0, null());
+            if event.is_null() {
+                let error = std::io::Error::last_os_error().to_string();
+                CloseHandle(file);
+                return Err(error);
+            }
+            let mut overlap: Box<OVERLAPPED> = Box::new(zeroed());
+            overlap.hEvent = event;
+            Ok(Self {
+                file,
+                overlap,
+                buffer: vec![0; size],
+                pending: false,
+            })
+        }
+    }
+    fn poll(&mut self) -> Result<Option<Vec<u8>>, String> {
+        unsafe {
+            let mut bytes = 0;
+            if !self.pending {
+                ResetEvent(self.overlap.hEvent);
+                self.overlap.Internal = 0;
+                self.overlap.InternalHigh = 0;
+                let ok = ReadFile(
+                    self.file,
+                    self.buffer.as_mut_ptr(),
+                    self.buffer.len() as u32,
+                    null_mut(),
+                    self.overlap.as_mut(),
+                );
+                if ok == 0 && GetLastError() != ERROR_IO_PENDING {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                self.pending = true;
+            }
+            if GetOverlappedResult(self.file, self.overlap.as_mut(), &mut bytes, 0) == 0 {
+                if GetLastError() == ERROR_IO_INCOMPLETE {
+                    return Ok(None);
+                }
+                self.pending = false;
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            self.pending = false;
+            Ok(Some(
+                self.buffer[..(bytes as usize).min(self.buffer.len())].to_vec(),
+            ))
+        }
+    }
+}
+impl Drop for HidReader {
+    fn drop(&mut self) {
+        unsafe {
+            if self.pending {
+                CancelIoEx(self.file, self.overlap.as_mut());
+                let mut bytes = 0;
+                GetOverlappedResult(self.file, self.overlap.as_mut(), &mut bytes, 1);
+            }
+            CloseHandle(self.overlap.hEvent);
+            CloseHandle(self.file);
+        }
+    }
+}
+
 impl Device {
     unsafe fn load(handle: HANDLE) -> Option<Self> {
         unsafe {
@@ -499,7 +649,15 @@ impl Device {
                     });
                 }
             }
+            let (reader, reader_error) =
+                match HidReader::open(&path, caps.InputReportByteLength as usize) {
+                    Ok(reader) => (Some(reader), None),
+                    Err(error) => (None, Some(error)),
+                };
             Some(Self {
+                reader,
+                reader_error,
+                reports: 0,
                 id,
                 name,
                 prep,
