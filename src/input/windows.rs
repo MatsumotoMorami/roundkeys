@@ -2,7 +2,7 @@ use super::*;
 use crate::model::Binding;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
     time::{Duration, Instant},
@@ -13,10 +13,19 @@ use windows_sys::Win32::{
     Storage::FileSystem::*,
     System::{IO::*, LibraryLoader::GetModuleHandleW, Threading::*},
     UI::{
-        Input::{KeyboardAndMouse::GetAsyncKeyState, *},
+        Input::{
+            KeyboardAndMouse::{
+                GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
+                VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+            },
+            *,
+        },
         WindowsAndMessaging::*,
     },
 };
+
+#[cfg(test)]
+mod tests;
 
 struct Axis {
     cap: HIDP_VALUE_CAPS,
@@ -34,12 +43,66 @@ struct Device {
     reader: Option<HidReader>,
     reader_error: Option<String>,
     reports: u64,
+    streams: ReportStreams,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportSource {
+    Direct,
+    Raw,
+}
+
+// Windows can deliver the same ordered reports through both APIs, with one queue
+// a few frames behind the other. Consume matching copies without replaying edges.
+#[derive(Default)]
+struct ReportStreams {
+    leader: Option<ReportSource>,
+    unmatched: VecDeque<(Instant, Vec<u8>)>,
+    last_direct: Option<(Instant, Vec<u8>)>,
+    last_raw: Option<(Instant, Vec<u8>)>,
+}
+impl ReportStreams {
+    fn accept(&mut self, source: ReportSource, report: &[u8], now: Instant) -> bool {
+        let last = match source {
+            ReportSource::Direct => &mut self.last_direct,
+            ReportSource::Raw => &mut self.last_raw,
+        };
+        let (at, previous) = last.get_or_insert_with(|| (now, Vec::new()));
+        let recent = now.duration_since(*at) <= Duration::from_millis(100);
+        *at = now;
+        if recent && previous == report {
+            return false;
+        }
+        previous.clear();
+        previous.extend_from_slice(report);
+        while self
+            .unmatched
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_millis(100))
+        {
+            self.unmatched.pop_front();
+        }
+        if self.leader != Some(source) {
+            if let Some(i) = self.unmatched.iter().position(|(_, r)| r == report) {
+                self.unmatched.drain(..=i);
+                return false;
+            }
+            self.unmatched.clear();
+            self.leader = Some(source);
+        }
+        if self.unmatched.len() == 128 {
+            self.unmatched.pop_front();
+        }
+        self.unmatched.push_back((now, report.to_vec()));
+        true
+    }
 }
 struct Engine {
     shared: Shared,
     devices: HashMap<usize, Device>,
     expiry: HashMap<Binding, f64>,
     keyboard_down: HashSet<u16>,
+    raw_keys: HashSet<(usize, u16)>,
     last_hid_status: Instant,
 }
 thread_local! { static ENGINE:RefCell<Option<Engine>>=const{RefCell::new(None)}; }
@@ -77,8 +140,7 @@ pub fn run(shared: Shared) {
                 format!("输入窗口创建失败：{}", std::io::Error::last_os_error());
             return;
         }
-        // GUI frameworks register keyboard Raw Input again inside this process.
-        // Keep HID on the dedicated sink; keyboard sampling below does not compete.
+        // Register the keyboard separately so controller input survives a keyboard registration failure.
         let inputs: Vec<_> = [4, 5, 8]
             .iter()
             .map(|&usage| RAWINPUTDEVICE {
@@ -98,19 +160,39 @@ pub fn run(shared: Shared) {
                 format!("后台输入注册失败：{}", std::io::Error::last_os_error());
             return;
         }
+        let keyboard = RAWINPUTDEVICE {
+            usUsagePage: 1,
+            usUsage: 6,
+            dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
+            hwndTarget: hwnd,
+        };
+        let raw_keyboard =
+            RegisterRawInputDevices(&keyboard, 1, size_of::<RAWINPUTDEVICE>() as u32) != 0;
+        let status = if raw_keyboard {
+            "后台 Raw Input 键盘 + HID 监听".into()
+        } else {
+            format!(
+                "键盘 Raw Input 注册失败，回退到采样：{}",
+                std::io::Error::last_os_error()
+            )
+        };
         let mut engine = Engine {
             shared: shared.clone(),
             devices: HashMap::new(),
             expiry: HashMap::new(),
             keyboard_down: HashSet::new(),
+            raw_keys: HashSet::new(),
             last_hid_status: Instant::now(),
         };
         engine.discover();
         ENGINE.with(|e| *e.borrow_mut() = Some(engine));
-        shared.lock().unwrap().input_status = "后台键盘采样 + HID 监听 · 无需窗口焦点".into();
+        shared.lock().unwrap().input_status = status;
         let mut message: MSG = zeroed();
         loop {
-            while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            // A busy Raw Input queue must still give direct HID reads and axis releases a turn.
+            let mut processed = 0;
+            while processed < 128 && PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                processed += 1;
                 if message.message == WM_QUIT {
                     return;
                 }
@@ -120,11 +202,13 @@ pub fn run(shared: Shared) {
             ENGINE.with(|e| {
                 if let Some(e) = e.borrow_mut().as_mut() {
                     e.poll_hid();
-                    e.poll_keyboard();
+                    e.poll_keyboard(raw_keyboard);
                     e.expire();
                 }
             });
-            std::thread::sleep(Duration::from_millis(2));
+            if processed < 128 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
     }
 }
@@ -137,6 +221,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }),
         WM_INPUT_DEVICE_CHANGE => ENGINE.with(|e| {
             if let Some(e) = e.borrow_mut().as_mut() {
+                if w == GIDC_REMOVAL as usize {
+                    let removed: Vec<_> = e
+                        .raw_keys
+                        .iter()
+                        .filter(|(device, _)| *device == l as usize)
+                        .copied()
+                        .collect();
+                    for (device, code) in removed {
+                        e.keyboard_event(device, code, false);
+                    }
+                }
                 e.discover();
             }
         }),
@@ -144,7 +239,82 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
     }
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
+fn raw_key_code(key: &RAWKEYBOARD) -> Option<u16> {
+    if !(1..255).contains(&key.VKey) || key.MakeCode == 0xff {
+        return None;
+    }
+    let extended = key.Flags as u32 & RI_KEY_E0 != 0;
+    Some(match key.VKey {
+        VK_SHIFT if extended => return None, // synthetic Shift prefix of an extended key
+        VK_SHIFT => {
+            if key.MakeCode == 0x36 {
+                VK_RSHIFT
+            } else {
+                VK_LSHIFT
+            }
+        }
+        VK_CONTROL => {
+            if extended {
+                VK_RCONTROL
+            } else {
+                VK_LCONTROL
+            }
+        }
+        VK_MENU => {
+            if extended {
+                VK_RMENU
+            } else {
+                VK_LMENU
+            }
+        }
+        code => code,
+    })
+}
+fn modifier(code: u16) -> Option<u16> {
+    match code {
+        VK_LSHIFT | VK_RSHIFT => Some(VK_SHIFT),
+        VK_LCONTROL | VK_RCONTROL => Some(VK_CONTROL),
+        VK_LMENU | VK_RMENU => Some(VK_MENU),
+        _ => None,
+    }
+}
 impl Engine {
+    fn keyboard_event(&mut self, device: usize, code: u16, down: bool) {
+        let alias = modifier(code);
+        let mut m = self.shared.lock().unwrap();
+        let bound = |key| {
+            m.config
+                .lanes
+                .iter()
+                .any(|lane| lane.bindings.contains(&Binding::Keyboard { code: key }))
+        };
+        let primary = bound(code) || m.capture.is_some();
+        let generic = alias.filter(|&key| bound(key));
+        if down && !primary && generic.is_none() {
+            return;
+        }
+        let changed = if down {
+            self.raw_keys.insert((device, code))
+        } else {
+            self.raw_keys.remove(&(device, code))
+        };
+        if !changed {
+            return;
+        }
+        let now = m.now();
+        for key in [Some(code), alias].into_iter().flatten() {
+            let binding = Binding::Keyboard { code: key };
+            let held = self
+                .raw_keys
+                .iter()
+                .any(|&(_, c)| c == key || modifier(c) == Some(key));
+            if held != m.down.contains(&binding)
+                && (!held || (key == code && primary) || generic == Some(key))
+            {
+                m.transition(binding, held, now);
+            }
+        }
+    }
     fn poll_hid(&mut self) {
         for d in self.devices.values_mut() {
             for _ in 0..32 {
@@ -152,7 +322,14 @@ impl Engine {
                     break;
                 };
                 match reader.poll() {
-                    Ok(Some(report)) => parse_report(d, &self.shared, &mut self.expiry, &report),
+                    Ok(Some(report)) => {
+                        d.reports += 1;
+                        if d.streams
+                            .accept(ReportSource::Direct, &report, Instant::now())
+                        {
+                            parse_report(d, &self.shared, &mut self.expiry, &report);
+                        }
+                    }
                     Ok(None) => break,
                     Err(error) => {
                         d.reader_error = Some(error);
@@ -186,7 +363,7 @@ impl Engine {
             );
         }
     }
-    fn poll_keyboard(&mut self) {
+    fn poll_keyboard(&mut self, raw_keyboard: bool) {
         let mut m = self.shared.lock().unwrap();
         let now = m.now();
         let mut candidates: HashSet<u16> = m
@@ -195,13 +372,13 @@ impl Engine {
             .iter()
             .flat_map(|lane| lane.bindings.iter())
             .filter_map(|b| match b {
-                Binding::Keyboard { code } => Some(*code),
+                Binding::Keyboard { code } if !raw_keyboard || *code < 8 => Some(*code),
                 _ => None,
             })
             .chain(self.keyboard_down.iter().copied())
             .collect();
         // Only bound keys are sampled normally; binding capture temporarily enables all keys.
-        if m.capture.is_some() {
+        if !raw_keyboard && m.capture.is_some() {
             candidates.extend(8..=254);
         }
         for code in candidates {
@@ -305,7 +482,18 @@ impl Engine {
                 return;
             }
             let raw = &*(buf.as_ptr().cast::<RAWINPUT>());
-            if raw.header.dwType == RIM_TYPEHID {
+            if raw.header.dwType == RIM_TYPEKEYBOARD
+                && size >= header + size_of::<RAWKEYBOARD>() as u32
+            {
+                let key = &raw.data.keyboard;
+                if let Some(code) = raw_key_code(key) {
+                    self.keyboard_event(
+                        raw.header.hDevice as usize,
+                        code,
+                        key.Flags as u32 & RI_KEY_BREAK == 0,
+                    );
+                }
+            } else if raw.header.dwType == RIM_TYPEHID {
                 if size < header + 8 {
                     return;
                 }
@@ -332,7 +520,10 @@ impl Engine {
                         start.add(n * hid.dwSizeHid as usize),
                         hid.dwSizeHid as usize,
                     );
-                    if d.reader.is_none() {
+                    d.reports += 1;
+                    if d.reader.is_none()
+                        || d.streams.accept(ReportSource::Raw, report, Instant::now())
+                    {
                         parse_report(d, &self.shared, &mut self.expiry, report);
                     }
                 }
@@ -363,7 +554,6 @@ fn parse_report(
     if report.is_empty() {
         return;
     }
-    d.reports += 1;
     unsafe {
         let mut m = shared.lock().unwrap();
         let now = m.now();
@@ -658,6 +848,7 @@ impl Device {
                 reader,
                 reader_error,
                 reports: 0,
+                streams: ReportStreams::default(),
                 id,
                 name,
                 prep,

@@ -29,13 +29,17 @@ fn main() -> eframe::Result {
     };
     let shared = Arc::new(Mutex::new(Model::new(config)));
     shared.lock().unwrap().demo = std::env::args().any(|a| a == "--demo");
-    input::start(shared.clone());
+    let input_check = std::env::args().any(|a| a == "--input-check");
+    let headless = std::env::args().any(|a| a == "--headless");
+    if input_check || headless {
+        input::start(shared.clone());
+    }
     let port = std::env::var("ROUNDKEYS_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(17842);
     server::start(shared.clone(), port);
-    if std::env::args().any(|a| a == "--input-check") {
+    if input_check {
         std::thread::sleep(std::time::Duration::from_secs(5));
         let mut m = shared.lock().unwrap();
         let snapshot = m.snapshot();
@@ -45,7 +49,7 @@ fn main() -> eframe::Result {
         );
         return Ok(());
     }
-    if std::env::args().any(|a| a == "--headless") {
+    if headless {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
@@ -67,6 +71,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RoundKeys · Keys + Scratch",
         options,
-        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, shared, config_path, port, error)))),
+        Box::new(move |cc| {
+            // Windows routes a keyboard usage to the last window registered in the process.
+            // Start our background sink after winit has created its event loop.
+            input::start(shared.clone());
+            Ok(Box::new(ui::App::new(cc, shared, config_path, port, error)))
+        }),
     )
 }
