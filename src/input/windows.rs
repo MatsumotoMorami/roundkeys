@@ -101,7 +101,8 @@ struct Engine {
     shared: Shared,
     devices: HashMap<usize, Device>,
     expiry: HashMap<Binding, f64>,
-    keyboard_down: HashSet<u16>,
+    sampled_keys: HashSet<u16>,
+    recent_raw: HashMap<u16, Instant>,
     raw_keys: HashSet<(usize, u16)>,
     last_hid_status: Instant,
 }
@@ -180,7 +181,8 @@ pub fn run(shared: Shared) {
             shared: shared.clone(),
             devices: HashMap::new(),
             expiry: HashMap::new(),
-            keyboard_down: HashSet::new(),
+            sampled_keys: HashSet::new(),
+            recent_raw: HashMap::new(),
             raw_keys: HashSet::new(),
             last_hid_status: Instant::now(),
         };
@@ -298,7 +300,14 @@ impl Engine {
         } else {
             self.raw_keys.remove(&(device, code))
         };
-        if !changed {
+        let mut took_sample = false;
+        for key in [Some(code), alias].into_iter().flatten() {
+            if changed || self.sampled_keys.contains(&key) {
+                self.recent_raw.insert(key, Instant::now());
+                took_sample |= self.sampled_keys.remove(&key);
+            }
+        }
+        if !changed && !took_sample {
             return;
         }
         let now = m.now();
@@ -364,18 +373,25 @@ impl Engine {
         }
     }
     fn poll_keyboard(&mut self, raw_keyboard: bool) {
+        self.poll_keyboard_with(raw_keyboard, |code| unsafe {
+            GetAsyncKeyState(code as i32) < 0
+        });
+    }
+    fn poll_keyboard_with(&mut self, raw_keyboard: bool, is_down: impl Fn(u16) -> bool) {
         let mut m = self.shared.lock().unwrap();
         let now = m.now();
+        self.recent_raw
+            .retain(|_, at| at.elapsed() < Duration::from_millis(12));
         let mut candidates: HashSet<u16> = m
             .config
             .lanes
             .iter()
             .flat_map(|lane| lane.bindings.iter())
             .filter_map(|b| match b {
-                Binding::Keyboard { code } if !raw_keyboard || *code < 8 => Some(*code),
+                Binding::Keyboard { code } => Some(*code),
                 _ => None,
             })
-            .chain(self.keyboard_down.iter().copied())
+            .chain(self.sampled_keys.iter().copied())
             .collect();
         // Only bound keys are sampled normally; binding capture temporarily enables all keys.
         if !raw_keyboard && m.capture.is_some() {
@@ -383,14 +399,19 @@ impl Engine {
         }
         for code in candidates {
             // High bit is current state. Do not consume the unreliable "recently pressed" bit.
-            let down = unsafe { GetAsyncKeyState(code as i32) } < 0;
-            if down != self.keyboard_down.contains(&code) {
-                if down {
-                    self.keyboard_down.insert(code);
-                } else {
-                    self.keyboard_down.remove(&code);
+            if self.recent_raw.contains_key(&code) {
+                continue;
+            }
+            if is_down(code) {
+                if self.sampled_keys.insert(code) && !m.down.contains(&Binding::Keyboard { code }) {
+                    m.transition(Binding::Keyboard { code }, true, now);
                 }
-                m.transition(Binding::Keyboard { code }, down, now);
+            } else if self.sampled_keys.remove(&code) {
+                // Only a key observed down by the sampler can be released by it.
+                // A zero from an inaccessible keyboard state must not cancel a raw press.
+                self.raw_keys
+                    .retain(|&(_, c)| c != code && modifier(c) != Some(code));
+                m.transition(Binding::Keyboard { code }, false, now);
             }
         }
     }

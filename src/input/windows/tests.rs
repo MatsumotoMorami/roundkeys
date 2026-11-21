@@ -7,7 +7,8 @@ fn engine() -> Engine {
         shared: Arc::new(Mutex::new(Model::new(Config::default()))),
         devices: HashMap::new(),
         expiry: HashMap::new(),
-        keyboard_down: HashSet::new(),
+        sampled_keys: HashSet::new(),
+        recent_raw: HashMap::new(),
         raw_keys: HashSet::new(),
         last_hid_status: Instant::now(),
     }
@@ -28,6 +29,27 @@ fn quick_taps_and_overlapping_keyboards_reach_the_overlay() {
     let mut model = e.shared.lock().unwrap();
     assert!(!model.pressed()[1]);
     assert_eq!(model.snapshot().counts[1], 2);
+}
+
+#[test]
+fn bound_key_survives_raw_silence_and_transport_handoff() {
+    let mut e = engine();
+    let code = b'S' as u16;
+    let sample = |e: &mut Engine, held| e.poll_keyboard_with(true, |k| held && k == code);
+    sample(&mut e, true);
+    sample(&mut e, false);
+    sample(&mut e, true);
+    e.keyboard_event(1, code, true);
+    e.keyboard_event(1, code, false);
+    sample(&mut e, true); // delayed state after raw release
+    assert!(!e.shared.lock().unwrap().pressed()[1]);
+    e.keyboard_event(1, code, true);
+    e.recent_raw.clear(); // raw stream goes quiet during a hold
+    sample(&mut e, true);
+    sample(&mut e, false);
+    let mut model = e.shared.lock().unwrap();
+    assert!(!model.pressed()[1]);
+    assert_eq!(model.snapshot().counts[1], 3);
 }
 
 #[test]

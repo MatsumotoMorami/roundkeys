@@ -1,6 +1,6 @@
 [package]
 name = "roundkeys"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Rounded 7-key and scratch input visualizer with an OBS browser source"
 license = "MIT"
